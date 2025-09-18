@@ -1,3 +1,24 @@
+Significant changes were made during 2018, these were stored offline and are now being committed.
+
+* On Debian the package libpcap0.8-dev or later is required as a prerequisite, with libnetfilter-log-dev optional.
+
+* If the packet is explicitly marked as already being TZSP-encapsulated then drop it immediately. If it is Ethernet then look at the Ethertype, setting pIPHead so that we can check the destination etc. in an attempt to avoid loops, this should handle both straight Ethernet and VLAN traffic; also handle _RAW and _SLL as trivial. For the moment let anything else through.
+
+* Accept encapsulating protocols (MPLS, PPoE and QinQ) and all IP6 without inspection of their content on the assumption that it will be destined for a non-local network so loops are unlikely.
+
+* The TZSP protocol field needs to track the datalink layer to reflect what's actually been captured rather than assuming it's Ethernet.
+
+* The DLC packet types now exceed 255 so more than 8 bits of the 16-bit protocol field are needed. It's probably safest to be absolutely blatant in breaking the TZSP encapsulation so that Wireshark comes up with a completely unambiguous warning that something unexpected has been seen. MarkMLl.
+
+* If there is more than one interface being monitored then yield in an attempt to improve interleave. The -y option inverts the default behaviour.
+
+* Added this to get the capturing device's MAC address for a TZSP tag.
+
+* Added reopen loop, specifically to handle vanishing PPP interfaces.
+
+Also see examples in port-mirroring.conf
+
+
 port-mirroring
 ================
 
@@ -16,6 +37,8 @@ openwrt下编译的Makefile在 openwrt/Makefile
 ## 预编译好的程序
 
 <https://code.google.com/p/port-mirroring/downloads/list>
+
+<https://github.com/Akagi201/port-mirroring>
 
 ## What is this "port mirroring"?
 

@@ -32,6 +32,7 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -46,11 +47,20 @@
 #include <linux/rtnetlink.h>
 #ifdef	_ENABLE_THREADS
 #include <pthread.h>
+#include <sched.h>
 #endif
 #include <errno.h>
 #include "pcap.h"
+#ifdef _ENABLE_NFLOG
+#include <libnetfilter_log/libnetfilter_log.h>
+#endif
+
+// On Debian the package libpcap0.8-dev or later is required as a prerequisite,
+// with libnetfilter-log-dev optional. MarkMLl.
 
 #pragma pack(1)
+
+#define BANNER		"Copyright (c) 2012 Bruce Geng and others. $Id: port-mirroring.c 30 2018-06-18 10:02:03Z markMLl $"
 
 #define ETH_ALEN	6		/* Octets in one ethernet addr	*/
 #define ETH_P_ARP	0x0806		/* Address Resolution packet	*/
@@ -61,13 +71,15 @@
 #define	ARP_WAIT_TIME	500		/* Arp Response waiting time (ms) */
 #define ARP_ETH_PADDING	18		/* 18 bytes ethernet padding */
 
-#define MAX_SOURCE_IF	4	/* maxium four source interfaces */
+#define MAX_SOURCE_IF	8		/* maxium eight source interfaces */
 #define LINEBUF_MAX	1024
 #define OPTION_MAX 	255
 #define TZSP_PORT	37008
 #define ERRTIMEOUT	20
 #define MACADDRLEN	6
 #define BUFSIZE 8192
+
+#define REOPEN_SECONDS	1000
 
 typedef enum{
 	MYLOG_INFO = 0,	//info
@@ -78,6 +90,9 @@ typedef struct{
 	unsigned char	ver;
 	unsigned char	type;
 	unsigned short	proto;
+	unsigned char	serial_hdr;
+	unsigned char	serial_len;
+	unsigned char	serial[MACADDRLEN];
 	unsigned char	tagend;
 }TZSP_HEAD;
 
@@ -136,6 +151,7 @@ int opt_syslog = 0;
 int opt_debug = 0;
 int opt_promiscuous = 0;
 int opt_protocol = 1;		//0 - TZSP, 1 - TEE
+int opt_yield = 0;
 
 int debug_packets = 0;
 
@@ -156,6 +172,7 @@ unsigned long tLastInit = 0;
 pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+
 char*	getCurrentTime(){
 	time_t	tt;
 	struct  tm    	*vtm;
@@ -170,7 +187,8 @@ char*	getCurrentTime(){
             vtm->tm_min, vtm->tm_sec);
 	MacTime[19]=0;	
 	return MacTime;
-}
+} // getCurrentTime
+
 
 void writeLog( MYLOG_LEVEL ll, const char *message , ...){
 #ifdef _WIN32
@@ -209,14 +227,16 @@ void writeLog( MYLOG_LEVEL ll, const char *message , ...){
 	}
 	va_end(arg_ptr);
 #endif
-}
+} // writeLog
+
 
 void addMonitoringSource( const char * s ){
 	if( mirroring_source_num < MAX_SOURCE_IF ){
 		strncpy( mirroring_source[mirroring_source_num], s, OPTION_MAX);
 		mirroring_source_num++;
 	}
-}
+} // addMonitoringSource
+
 
 char * getUCIItem( char * buf, char * item ){
 	char * p1 = buf;
@@ -241,7 +261,8 @@ char * getUCIItem( char * buf, char * item ){
 	}else{
 		return NULL;
 	}
-}
+} // getUCIItem
+
 
 int getUCIConf( char * buf, char * option, char * value ){
 	
@@ -256,7 +277,8 @@ int getUCIConf( char * buf, char * option, char * value ){
 		}
 	}
 	return -1;
-}
+} // getUCIConf
+
 
 int loadCfg( const char * fpath ){
 	FILE * fp = fopen( fpath, "r" );
@@ -301,6 +323,7 @@ int loadCfg( const char * fpath ){
 					opt_protocol = 0;
 				}else{
 					writeLog( MYLOG_ERROR, "port-mirroring::loadCfg, protocol [%s] syntax error.\n", value );
+					return -1;
 				}
 			}
 		}
@@ -309,7 +332,8 @@ int loadCfg( const char * fpath ){
 
 	fclose( fp );
 	return 0;
-}
+} // loadCfg
+
 
 void init(){
 	int i;
@@ -326,7 +350,8 @@ void init(){
 	memset( remoteMac, 0, MACADDRLEN );
 	memset( opt_config, 0, sizeof(opt_config));
 	strcpy( opt_pid, "/var/run/port-mirroring.pid" );
-}
+} // init
+
 
 int reopenSendHandle( const char * device ){
 	char	errbuf[PCAP_ERRBUF_SIZE] = {0};
@@ -338,22 +363,24 @@ int reopenSendHandle( const char * device ){
 	}
 	sendHandle = pcap_open_live( device, 65536, 0, 100, errbuf );
 	if (sendHandle == NULL ) {
-		writeLog( MYLOG_ERROR, "port-mirroring::reopenSendHandle, couldn't open device \"%s\": %s\n", mirroring_target_if, errbuf);
+		writeLog( MYLOG_ERROR, "port-mirroring::reopenSendHandle, couldn't open device \"%s\": %s.\n", mirroring_target_if, errbuf);
 		return -1;
 	}else{
 		if( opt_debug ){
 			writeLog( MYLOG_INFO, "port-mirroring::reopenSendHandle %s success.\n", device );
 		}
 	}
-}
+} // reopenSendHandle
+
 
 char*	printMACStr( const char *mac){
 	static char	macStr[20]={0};
-	sprintf( macStr , "%02x%02x%02x%02x%02x%02x" , 
+	sprintf( macStr , "%02x:%02x:%02x:%02x:%02x:%02x" , 
 		(unsigned char)mac[0], (unsigned char)mac[1] , (unsigned char)mac[2] , 
 		(unsigned char)mac[3] , (unsigned char)mac[4] , (unsigned char)mac[5]);
 	return	macStr;
-}
+} // printMACStr
+
 
 int readNlSock(int sockFd, char *bufPtr, int seqNum, int pId){
 	struct nlmsghdr *nlHdr;
@@ -389,7 +416,8 @@ int readNlSock(int sockFd, char *bufPtr, int seqNum, int pId){
 	} while( (nlHdr->nlmsg_seq != seqNum) || (nlHdr->nlmsg_pid != pId) );
 
 	return msgLen;
-}
+} // readNlSock
+
 
 int getInterfaceMac( const char * device, char * mac ){
 	int s;
@@ -413,7 +441,8 @@ int getInterfaceMac( const char * device, char * mac ){
 	memcpy( mac, buffer.ifr_hwaddr.sa_data, MACADDRLEN );
 	
 	return 0;
-}
+} // getInterfaceMac
+
 
 int getInterfaceIP( const char * device, unsigned int * ip ){
 	int s;
@@ -438,7 +467,8 @@ int getInterfaceIP( const char * device, unsigned int * ip ){
 	*ip = ((struct sockaddr_in *)&buffer.ifr_addr)->sin_addr.s_addr;
 	
 	return 0;
-}
+} // getInterfaceIP
+
 
 int getSenderInterface( unsigned int targetIP, char * device, char * mac ){
 	struct nlmsghdr *nlMsg;
@@ -524,7 +554,8 @@ int getSenderInterface( unsigned int targetIP, char * device, char * mac ){
   	}
   	close(sock);
 	return 1;
-}
+} // getSenderInterface
+
 
 int getRemoteARP( unsigned int targetIP, const char * device, char * mac){
 	unsigned int localIP;
@@ -541,7 +572,7 @@ int getRemoteARP( unsigned int targetIP, const char * device, char * mac){
 	pcap_t * pHandle = pcap_open_live( device, 65536, 0, 500, errbuf );
 	
 	if (pHandle == NULL ) {
-		writeLog( MYLOG_ERROR, "port-mirroring::sendARP, couldn't open device \"%s\": %s\n", device, errbuf );
+		writeLog( MYLOG_ERROR, "port-mirroring::sendARP, couldn't open device \"%s\": %s.\n", device, errbuf );
 		return -1;
 	}
 	if( getInterfaceIP( device, &localIP ) < 0 ){
@@ -605,7 +636,8 @@ int getRemoteARP( unsigned int targetIP, const char * device, char * mac){
 	pcap_close(pHandle);
 	
 	return found;
-}
+} // getRemoteARP
+
 
 int initSendHandle(){
 
@@ -634,26 +666,38 @@ int initSendHandle(){
 					reopenSendHandle( device );
 				}else{
 					writeLog( MYLOG_ERROR, "port-mirroring::initSendHandle, can not get mac address of remote host.\n");
+					return -1;
 				}
 			}else{
 				writeLog( MYLOG_ERROR, "port-mirroring::initSendHandle, can not get sender interface.\n");
+				return -1;
 			}
 		}else{
 			writeLog( MYLOG_ERROR, "port-mirroring::initSendHandle, unknown protocol.\n");
+			return -1;
 		}
 	}
 	
 	return 0;
-}
+} // initSendHandle
 
-void packet_handler_ex( const struct pcap_pkthdr *header, const u_char *pkt_data){
+
+void packet_handler_ex( const int packet_type, const struct pcap_pkthdr *header, const u_char *pkt_data, const void *pMac ){
 	static char buf[2048];
 	
 	if( header->len <= 2 * MACADDRLEN ){
+		if ( opt_debug == 2 ) {
+			printf("\bS");
+		}
+		if ( opt_debug > 2 ) {
+			writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, short (%d byte) packet discarded.\n", header->len);
+		}
 		return;
 	}
 	#ifdef	_ENABLE_THREADS
-	pthread_mutex_lock( &mutex1 );
+	if (mirroring_source_num > 1) {
+		pthread_mutex_lock( &mutex1 );
+	}
 	#endif
 	
 	if( mirroring_type == 0 ){
@@ -691,51 +735,201 @@ void packet_handler_ex( const struct pcap_pkthdr *header, const u_char *pkt_data
 			}
 		}else{
 			//ignore packets sent to the remote mac address
+			if ( opt_debug == 2 ) {
+				printf("\bM");
+			}
+			if ( opt_debug > 2 ) {
+				writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, packet teed to remote MAC [%s] discarded.\n", printMACStr( remoteMac )); // TEST THIS MarkMLl
+			}
 		}
 	}else if( opt_protocol == 0 ){
 		//TSZP
+
+// If the packet is explicitly marked as already being TZSP-encapsulated then drop it
+// immediately. If it is Ethernet then look at the Ethertype, setting pIPHead so that
+// we can check the destination etc. in an attempt to avoid loops, this should handle
+// both straight Ethernet and VLAN traffic; also handle _RAW and _SLL as trivial. For
+// the moment let anything else through.
+//
+// I was planning to rewrite this using a BPF filter but it turns out that these have
+// some unpleasant properties when VLANs are involved. MarkMLl.
+
+		if( packet_type == DLT_TZSP ) {
+			#ifdef  _ENABLE_THREADS
+			if (mirroring_source_num > 1) {
+				pthread_mutex_unlock( &mutex1 );
+			}
+			#endif
+			if ( opt_debug == 2 ) {
+				printf("\bD");
+			}
+			if ( opt_debug > 2 ) {
+				writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, packet with DLT TZSP discarded.\n");
+			}
+			return;
+		}
+
 		if( header->len > 14 + sizeof(IP_HEADER) ){
 			IP_HEADER * pIPHead = NULL;
-			if( *(unsigned short *)(pkt_data + 12) == htons(0x0800)){
-				pIPHead = (IP_HEADER *)(pkt_data+14);
-			}else if(  *(unsigned short *)(pkt_data + 12) == htons(0x8100)){
-				pIPHead = (IP_HEADER *)(pkt_data+18);
-			}else{
-				#ifdef	_ENABLE_THREADS
-				pthread_mutex_unlock( &mutex1 );
-				#endif
-				return;
+			switch( packet_type ) {
+				case DLT_EN10MB: // NOTE: No support here for jumbo frames.
+				case DLT_EN3MB: {
+					unsigned short ethertype = ntohs(*(unsigned short *)(pkt_data + 12));
+					if( ethertype == 0x0800){
+						pIPHead = (IP_HEADER *)(pkt_data+14);
+					}else if( ethertype == 0x8100){
+						pIPHead = (IP_HEADER *)(pkt_data+18);
+					}else if ((ethertype == 0x8847) || (ethertype == 0x8848) || (ethertype == 0x8863) || (ethertype == 0x8864) || (ethertype == 0x88a8) || (ethertype == 0x86dd)) {
+
+// Accept encapsulating protocols (MPLS, PPoE and QinQ) and all IP6 without
+// inspection of their content on the assumption that it will be destined
+// for a non-local network so loops are unlikely. I'm not so much interested
+// here in deep inspection of packet content as in basic confirmation that
+// they're running if configured, and in detection of e.g. PPPoE interleaved
+// with local traffic on a shared interface. MarkMLl.
+
+					} else if (ethertype == 0x0806) {
+						#ifdef  _ENABLE_THREADS
+						if (mirroring_source_num > 1) {
+							pthread_mutex_unlock( &mutex1 );
+						}
+						#endif
+						if ( opt_debug == 2 ) {
+							printf("\bA");
+						}
+						if ( opt_debug > 2 ) {
+							writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, ARP packet (Ethertype 0x0806) discarded.\n");
+						}
+						return;
+					} else {
+						#ifdef	_ENABLE_THREADS
+						if (mirroring_source_num > 1) {
+							pthread_mutex_unlock( &mutex1 );
+						}
+						#endif
+						if ( opt_debug == 2 ) {
+							printf("\bE");
+						}
+						if ( opt_debug > 2 ) {
+							writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, packet with unknown Ethertype 0x%04x discarded.\n", ethertype);
+						}
+						return;
+					}
+					break; }
+				case DLT_RAW:
+					pIPHead = (IP_HEADER *)pkt_data;
+					break;
+				case DLT_LINUX_SLL:
+					pIPHead = (IP_HEADER *)(pkt_data+16);
+					break;
+				default:		// (Slower) BPF check here.
+					break;
 			}
+
 			if( pIPHead != NULL && pIPHead->destIP == mirroring_target_ip && pIPHead->proto == IPPROTO_UDP ){
 				UDP_HEADER * pUDPHead   = (UDP_HEADER * )((u_char*)pIPHead + sizeof(unsigned long) * ( pIPHead->h_lenver & 0xf));
 				//printf("iphlen=[%d], dport=[%u], TSZP=[%u].\n", sizeof(unsigned long) * ( pIPHead->h_lenver & 0xf), pUDPHead->uh_dport, htons(TZSP_PORT));
 				if( pUDPHead->uh_dport == htons(TZSP_PORT)){
 					//printf("TZSP ignored.\n");
 					#ifdef	_ENABLE_THREADS
-					pthread_mutex_unlock( &mutex1 );
+					if (mirroring_source_num > 1) {
+						pthread_mutex_unlock( &mutex1 );
+					}
 					#endif
+					if ( opt_debug == 2 ) {
+						printf("\bU");
+					}
+					if ( opt_debug > 2 ) {
+						writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, packet to TZSP target discarded.\n");
+					}
 					return;
 				}
 			}
 			if( sendSocket != -1 ){
 				TZSP_HEAD * pHead = (TZSP_HEAD *)buf;
 				int dataLen;
+				int discard = 0;
+
+// The TZSP protocol field needs to track the datalink layer to reflect what's
+// actually been captured rather than assuming it's Ethernet. Refer to the Wireshark
+// v2 dissector to find out the right symbolic value, noting that I don't know how
+// well it can handle the more unusual variants. MarkMLl.
 	
 				pHead->ver = 0x01;
 				pHead->type = 0x00;
-				pHead->proto = htons(0x01);
+				switch( packet_type ) {
+					case DLT_EN10MB:
+					case DLT_EN3MB:
+						pHead->proto = htons(0x01);
+						break;
+					case DLT_PPP:
+					case DLT_PPP_BSDOS:
+					case DLT_PPP_SERIAL:
+					case DLT_PPP_ETHER:
+					case DLT_JUNIPER_MLPPP:
+					case DLT_PPP_PPPD:
+					case DLT_JUNIPER_PPPOE:
+					case DLT_JUNIPER_PPPOE_ATM:
+					case DLT_JUNIPER_PPP:
+#ifdef DLT_PPP_WITH_DIR
+					case DLT_PPP_WITH_DIR:
+#endif
+					case DLT_C_HDLC:
+						pHead->proto = htons(4);
+						break;
+					case DLT_LINUX_SLL: // Much PPP traffic
+						discard = 16;
+					case DLT_RAW:
+						pHead->proto = htons(7);
+						break;
+					case DLT_IEEE802_11:
+					case DLT_IEEE802_11_RADIO:
+					case DLT_AIRONET_HEADER:
+						pHead->proto = htons(18);
+						break;
+					case DLT_PRISM_HEADER:
+						pHead->proto = htons(119);
+						break;
+					case DLT_IEEE802_11_RADIO_AVS:
+						pHead->proto = htons(127);
+						break;
+
+// The DLC packet types now exceed 255 so more than 8 bits of the 16-bit protocol
+// field are needed. Wireshark parses two bytes and doesn't mask out high bits
+// which are known to be unused (as of 2017), so there's no straightforward way
+// of propagating the packet type as a hint without it probably messing up the
+// TZSP dissector. Taking that into account, if an unknown packet type
+// is encountered it's probably safest to be absolutely blatant in breaking the
+// TZSP encapsulation so that Wireshark comes up with a completely unambiguous
+// warning that something unexpected has been seen. MarkMLl.
+
+					default:
+						if ( opt_debug >= 3 ) {
+							writeLog( MYLOG_INFO, "port-mirroring::packet_handler_ex, unknown DLT 0x%04x.\n", packet_type);
+						}
+						pHead->proto = htons((packet_type & 0x7fff) | 0x8000);
+				}
+				pHead->serial_hdr = 0x3c;
+				pHead->serial_len = MACADDRLEN;
+				memcpy(&pHead->serial, pMac, MACADDRLEN);
 				pHead->tagend = 0x01;
-				if( header->len <  sizeof(buf)-sizeof(TZSP_HEAD)){
-					dataLen = header->len;
+				if( header->len-discard <  sizeof(buf)-sizeof(TZSP_HEAD)){
+					dataLen = header->len-discard;
 				}else{
 					dataLen = sizeof(buf)-sizeof(TZSP_HEAD);
 				}
 				if( dataLen > 0 ){
-					memcpy( buf+sizeof(TZSP_HEAD), pkt_data, dataLen );
+					memcpy( buf+sizeof(TZSP_HEAD), pkt_data+discard, dataLen );
 					while( sendto( sendSocket, buf, dataLen+sizeof(TZSP_HEAD), 0, (struct sockaddr *)&sendSocket_sa, sizeof(sendSocket_sa)) < 0 ){
 						if( errno == EINTR || errno == EWOULDBLOCK){
+							if ( opt_debug == 2 ) {
+								printf("."); // Add an extra dot, only one will be backspaced
+							}
 							//printf("packet_handler_ex, send failed, ERRNO is EINTR or EWOULDBLOCK.\n");
 						}else{
+							if ( opt_debug == 2 ) {
+								printf("\b!."); // Replace dot with shrike, then one to be lost
+							}
 							//printf("packet_handler_ex, send failed.\n");
 							break;
 						}
@@ -745,18 +939,164 @@ void packet_handler_ex( const struct pcap_pkthdr *header, const u_char *pkt_data
 		}
 	}
 	#ifdef	_ENABLE_THREADS
-	pthread_mutex_unlock( &mutex1 );
+	if (mirroring_source_num > 1) {
+		pthread_mutex_unlock( &mutex1 );
+	}
 	#endif
-	if( opt_debug ){
+	if( opt_debug == 1 ){
 		debug_packets++;
 		if( debug_packets >= 1000 ){
 			writeLog( MYLOG_INFO, "port-mirroring, 1000 packets mirrored.\n");
 			debug_packets = 0;
 		}
 	}
-}
+	if ( opt_debug == 2 ) {
+		printf("\b");
+	}
+} // packet_handler_ex
 
-void* start_mirroring( void * dev ){
+
+#ifdef _ENABLE_NFLOG
+
+
+static int nflCallback(struct nflog_g_handle *gh, struct nfgenmsg *nfmsg, struct nflog_data *nfa, void *data) {
+//	if (opt_debug) {
+//		writeLog( MYLOG_INFO, "port-mirroring::nflCallback.\n");
+//	}
+
+// There are two possibilities here. In the first we have from somewhere got
+// source and destination MAC addresses and an Ethertype, however the
+// destination address is not normally known in the context of iptables rules
+// (such as have generated the logged packet) and the Ethertype can generally
+// be assumed to be IP or possibly IP6. In the second we don't have a MAC
+// address, in which case we assume that we are dealing with an IP message.
+// In practice assume the second case always pertains.
+
+	char * payload;
+	int packet_type = DLT_RAW;
+
+	struct pcap_pkthdr header;
+	header.ts.tv_sec = 0; // Not used
+	header.ts.tv_usec = 0;
+	header.caplen = nflog_get_payload(nfa, &payload);
+	header.len = header.caplen;
+
+	typedef struct{
+		unsigned int mark;    
+		unsigned short prefix;
+	} FORGED_MAC;
+	FORGED_MAC mac;
+	char * eor;
+	mac.mark = htonl(nflog_get_nfmark(nfa));
+	mac.prefix = htons(strtoul(nflog_get_prefix(nfa), &eor, 10) % 65536);
+	if ( opt_debug == 2 ) {
+		printf(".");
+	}
+	packet_handler_ex(packet_type, &header, payload, &mac);
+	return 0;
+} // nflCallback
+
+
+#endif
+
+
+void * start_mirroring_nflog(int group) {
+#ifndef _ENABLE_NFLOG
+	writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, no NFLOG support, use .configure --enable-nflog.\n", group);
+	return NULL;
+#else
+	struct nflog_handle *nfh = NULL;
+	struct nflog_g_handle *gh = NULL;
+	int fd, rv;
+
+// NOTE: No support here for jumbo frames. Timeout is in 100 mSec units.
+
+#define NFLTIMEOUT 2
+#define NFLBUFSZ 4096
+	char buf[NFLBUFSZ];
+#ifdef  _ENABLE_THREADS
+	sigset_t mask;
+
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &mask, NULL);
+#endif
+
+// https://serverfault.com/questions/610989/linux-nflog-documentation-configuration-from-c
+// https://www.pacificsimplicity.ca/blog/get-libnetfilterlog-and-working-examples-ulog-and-nflog
+// http://www.lt.netfilter.org/projects/libnetfilter_log/doxygen/group__Parsing.html
+
+//	if (opt_debug) {
+//		writeLog(MYLOG_INFO, "port-mirroring::start_mirroring, entering thread for group %d.\n", group);
+//	}
+
+	if (! (nfh = nflog_open())) {
+		writeLog(MYLOG_ERROR, "port-mirroring::start_mirroring, failed to get netlink handle for nflog group %d.\n", group);
+		return;
+	}
+
+	if (nflog_bind_pf(nfh, AF_INET) < 0) {
+		writeLog(MYLOG_ERROR, "port-mirroring::start_mirroring, failed to AF-bind netlink handle for nflog group %d.\n", group);
+		nflog_close(nfh);
+		return;
+	}
+
+	if (! (gh = nflog_bind_group(nfh, group))) {
+		writeLog(MYLOG_ERROR, "port-mirroring::start_mirroring, failed to group-bind netlink handle for nflog group %d.\n", group);
+		nflog_close(nfh);
+		return;
+	}
+
+	if (nflog_set_mode(gh, NFULNL_COPY_PACKET, 0xffff) < 0) {
+		writeLog(MYLOG_ERROR, "port-mirroring::start_mirroring, failed to set netlink handle mode for nflog group %d.\n", group);
+		nflog_unbind_group(gh);
+		nflog_close(nfh);
+		return;
+	}
+
+	if (nflog_set_nlbufsiz(gh, NFLBUFSZ) < 0) {
+		writeLog(MYLOG_ERROR, "port-mirroring::start_mirroring, failed to set buffer size for nflog group %d.\n", group);
+		nflog_unbind_group(gh);
+		nflog_close(nfh);
+		return;
+	}
+
+	if (nflog_set_timeout(gh, NFLTIMEOUT) < 0) {
+		writeLog(MYLOG_INFO, "port-mirroring::start_mirroring, failed to set timeout for nflog group %d.\n", group);
+	}
+	fd = nflog_fd(nfh);
+
+	nflog_callback_register(gh, &nflCallback, NULL);
+
+	if (opt_debug) {
+		writeLog(MYLOG_INFO, "port-mirroring::start_mirroring, started NFLOG group %d.\n", group);
+	}
+
+	while ((rv = recv(fd, buf, sizeof(buf), 0)) && rv >= 0) {
+		nflog_handle_packet(nfh, buf, rv);
+
+// If there is more than one interface being monitored then yield in an attempt
+// to improve interleave. The -y option inverts the default behaviour. MarkMLl.
+
+		if ((mirroring_source_num > 1) != opt_yield) {
+			pthread_yield();
+		}
+		if ( opt_debug >= 2 ) {
+			fflush(stdout);
+		}
+	}
+
+	nflog_unbind_group(gh);
+	nflog_close(nfh);
+//	if (opt_debug) {
+//		writeLog(MYLOG_INFO, "port-mirroring::start_mirroring, exiting thread for group %d.\n", group);
+//	}
+#endif
+} // start_mirroring_nflog
+
+
+void* start_mirroring_if( void * dev ){
+	struct ifreq if_details;
 	pcap_t *handle;		/* Session handle */
 	char errbuf[PCAP_ERRBUF_SIZE];	/* Error string */
 	struct bpf_program fp;		/* The compiled filter expression */
@@ -770,46 +1110,123 @@ void* start_mirroring( void * dev ){
 	sigaddset(&mask, SIGTERM);
 	pthread_sigmask(SIG_BLOCK, &mask, NULL);
 #endif
+	long reopen_seconds = -1;
+	struct timeval reopen_start;
+	struct timeval reopen_now;
 
+// Added this to get the capturing device's MAC address for a TZSP tag. MarkMLl.
+
+	memset(&if_details, 0x00, sizeof(if_details));
+	res = socket(PF_INET, SOCK_DGRAM, 0);
+	if (res >= 0) {
+		strcpy(if_details.ifr_name, dev);
+		ioctl(res, SIOCGIFHWADDR, &if_details);
+		res = close(res);
+	}
+	res = 0;
+	if( opt_debug ){
+		writeLog( MYLOG_INFO, "port-mirroring::start_mirroring, started device \"%s\" MAC %02x:%02x:%02x:%02x:%02x:%02x.\n",
+			(const char*)dev, (unsigned char) if_details.ifr_hwaddr.sa_data[0], (unsigned char) if_details.ifr_hwaddr.sa_data[1],
+				(unsigned char) if_details.ifr_hwaddr.sa_data[2], (unsigned char) if_details.ifr_hwaddr.sa_data[3],
+				(unsigned char) if_details.ifr_hwaddr.sa_data[4], (unsigned char) if_details.ifr_hwaddr.sa_data[5]);
+	}
+
+// Added reopen loop, specifically to handle vanishing PPP interfaces. MarkMLl.
+
+// TODO: command-line option to specify retries.
+
+	gettimeofday(&reopen_start, NULL);
 start_handle:
 	handle = pcap_open_live( (const char*)dev, 65536, opt_promiscuous, 100, errbuf );
+	gettimeofday(&reopen_now, NULL);
 	if (handle == NULL ) {
-		writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, couldn't open device \"%s\": %s\n", (const char*)dev, errbuf);
-		return;
+		if ( (reopen_seconds < 0) || ((reopen_now.tv_sec - reopen_start.tv_sec) > reopen_seconds) ) {
+			writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, couldn't open device \"%s\": %s.\n", (const char*)dev, errbuf);
+			return NULL;
+		} else {
+			usleep(1000);			// Probably dwarfed by pcap_open_live()
+			goto start_handle;
+		}
 	}
-	
+	long start = (reopen_start.tv_sec * 1000000 + reopen_start.tv_usec) / 1000;
+	long now = (reopen_now.tv_sec * 1000000 + reopen_now.tv_usec) / 1000;
+	if ( reopen_seconds < 0 ) {			// Initial connection
+		if ( opt_debug ) {
+			writeLog( MYLOG_INFO, "port-mirroring::start_mirroring, initial connection overhead %d mSec.\n", now - start);
+		}
+	} else {
+		writeLog( MYLOG_INFO, "port-mirroring::start_mirroring, reconnected after %01.2f seconds.\n", (now - start) / 1000.0);
+	}
+
 	if( mirroring_filter[0] != '\0' ){
 		if( pcap_compile(handle, &fp, mirroring_filter, 0, 0 ) == -1) {
-			writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, couldn't parse filter \"%s\": %s\n", mirroring_filter, pcap_geterr(handle));
+			writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, couldn't parse filter \"%s\": %s.\n", mirroring_filter, pcap_geterr(handle));
 			pcap_close(handle);
-			return;
+			return NULL;
 	 	}
 	 	if (pcap_setfilter(handle, &fp) == -1) {
-	 		writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, couldn't install filter \"%s\": %s\n", mirroring_filter, pcap_geterr(handle));
+	 		writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, couldn't install filter \"%s\": %s.\n", mirroring_filter, pcap_geterr(handle));
 			pcap_close(handle);
-			return;
+			return NULL;
 		}
 	}
 	//start the capture
 	while( handle != NULL ){
 		res = pcap_next_ex( handle, &header, &pkt_data );
         	if( res > 0 ){
-            		packet_handler_ex( header, pkt_data );
+			if ( opt_debug == 2 ) {
+				printf(".");
+			}
+            		packet_handler_ex( pcap_datalink(handle), header, pkt_data, &if_details.ifr_hwaddr.sa_data[0] );
             	}else if( res == 0 ){	// Timeout elapsed
             		continue;
             	}else{
             		break;
         	}
+
+// If there is more than one interface being monitored then yield in an attempt
+// to improve interleave. The -y option inverts the default behaviour. MarkMLl.
+
+		if ((mirroring_source_num > 1) != opt_yield) {
+			sched_yield(); // pthread_yield();
+		}
+		if ( opt_debug >= 2 ) {
+			fflush(stdout);
+		}
     	}
     	if( res == -1 && handle != NULL ){
-    		writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, error reading the packets from \"%s\": %s\n", (const char*)dev, pcap_geterr(handle));
+    		writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, error reading the packets from \"%s\": %s.\n", (const char*)dev, pcap_geterr(handle));
     		pcap_close(handle);
-    		sleep( ERRTIMEOUT );
-    		writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, reopen device \"%s\".\n", (const char *)dev);
+    		writeLog( MYLOG_INFO, "port-mirroring::start_mirroring, reopen device \"%s\", will retry for %d seconds.\n", (const char *)dev, REOPEN_SECONDS);
+		reopen_seconds = REOPEN_SECONDS;
+	        gettimeofday(&reopen_start, NULL);
     		goto start_handle;
         }
-	return;
-}
+	return NULL;
+} // start_mirroring_if
+
+
+void* start_mirroring( void * dev ){
+
+// Is the device name NFL followed by a number in which case we get captured
+// data using the NFLOG API, or the name of a network interface? In either
+// case, data ultimately goes to packet_handler_ex().
+
+	if (! strncmp(dev, "NFL", 3)) {
+		char * eor;
+		int group = strtoul(&((char *)dev)[3], &eor, 10);
+		if (group <= 65535) {
+			start_mirroring_nflog(group);
+		} else {
+			writeLog( MYLOG_ERROR, "port-mirroring::start_mirroring, NFLOG group %d out of range.\n", group);
+			return NULL;
+		}
+
+	} else {
+		start_mirroring_if(dev);
+	}
+} // start_mirroring
+
 
 void write_pid(){
 	if( opt_daemon && opt_pid[0] != '\0' ){
@@ -819,7 +1236,8 @@ void write_pid(){
 			fclose(fp);
 		}
 	}
-}
+} // write_pid
+
 
 int fork_daemon(){
 	/* Our process ID and Session ID */
@@ -858,7 +1276,8 @@ int fork_daemon(){
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
         return 0;
-}
+} // fork_daemon
+
 
 void sig_handler( int signum ){
 	if( opt_debug ){
@@ -869,7 +1288,8 @@ void sig_handler( int signum ){
 		unlink( opt_pid );
 	}
 	exit(1);
-}
+} // sig_handler
+
 
 int main( int argc, char **argv ){
 	int i;
@@ -882,12 +1302,13 @@ int main( int argc, char **argv ){
         	{"daemon", no_argument, 0, 'b'},
         	{"debug", no_argument, 0, 'd' },
         	{"syslog", no_argument, 0, 's'},
+		{"yield", no_argument, 0, 'y'},
         	{NULL, 0, NULL, 0}
     	};
     	
     	init();
 	
-    	while ((c = getopt_long( argc, argv, "c:p:bds",
+    	while ((c = getopt_long( argc, argv, "c:p:bdsy",
                  long_options, &option_index)) != -1) {
         	int this_option_optind = optind ? optind : 1;
         	switch (c) {
@@ -905,11 +1326,14 @@ int main( int argc, char **argv ){
         			opt_daemon = 1;
         			break;
         		case 'd':
-        			opt_debug = 1;
+        			opt_debug += 1;
         			break;
         		case 's':
         			opt_syslog = 1;
         			break;
+			case 'y':
+				opt_yield = 1;
+				break;
         		default:
         			break;
         	}
@@ -932,7 +1356,7 @@ int main( int argc, char **argv ){
 		}
 	}else{
 		if( loadCfg( "/etc/config/port-mirroring" ) == -1 ){
-			if( loadCfg( "/etc/port-mirroring" ) == -1 ){
+			if( loadCfg( "/etc/port-mirroring.conf" ) == -1 ){
 				#ifdef _WIN32
 				if( loadCfg( "./port-mirroring" ) == -1 ){
 				#endif
@@ -944,29 +1368,49 @@ int main( int argc, char **argv ){
 			}
 		}
 	}
-	
-	writeLog( MYLOG_INFO, "port-mirroring::main, mirroring_type:[%s][%s], mirroring_source_num:[%d], target:[%s], filter:[%s], opt_promiscuous:[%d].\n",
-		mirroring_type == 0 ? "interface" : "remote", 
-		opt_protocol == 0 ? "TZSP" : "TEE",		
-		mirroring_source_num,
-		mirroring_target_if,
-		mirroring_filter,
-		opt_promiscuous );
-	
+	if (opt_debug) {
+		writeLog( MYLOG_INFO, "port-mirroring::main, %s.\n", BANNER);
+	}
+
+// Message here slightly different depending on whether we want to announce what port
+// we're routing TZSP packets to. MarkMLl.
+
+	if( opt_protocol == 0 ) {	
+		writeLog( MYLOG_INFO, "port-mirroring::main, mirroring_type:[%s,TZSP], mirroring_source_num:[%d], target:[%s:0x%04x], filter:[%s], opt_promiscuous:[%d].\n",
+			mirroring_type == 0 ? "interface" : "remote", 
+			mirroring_source_num,
+			mirroring_target_if,
+			TZSP_PORT,
+			mirroring_filter,
+			opt_promiscuous );
+	}else{
+		writeLog( MYLOG_INFO, "port-mirroring::main, mirroring_type:[%s,TEE], mirroring_source_num:[%d], target:[%s], filter:[%s], opt_promiscuous:[%d].\n",
+			mirroring_type == 0 ? "interface" : "remote", 
+			mirroring_source_num,
+			mirroring_target_if,
+			mirroring_filter,
+			opt_promiscuous );
+	}	
 	if( initSendHandle() != 0 ){
 		sig_handler( SIGTERM );
 		return -1;
 	}
 	#ifdef	_ENABLE_THREADS
+
+	pthread_t thread[MAX_SOURCE_IF];
+	memset(thread, 0, sizeof(thread));
+
 	for( i = 0 ; i < mirroring_source_num; i++){
 		if( mirroring_type == 0 && strcmp( mirroring_target_if, mirroring_source[i] ) == 0 ){
 			writeLog( MYLOG_INFO, "port-mirroring::main, source interface[%s] is ignored.\n", mirroring_target_if );
 		}else{
-			pthread_t thread1;
-			pthread_create( &thread1, NULL, start_mirroring, (void*) mirroring_source[i]);
-			pthread_join( thread1, NULL );
+			if( opt_debug ){
+				writeLog( MYLOG_INFO, "port-mirroring::main, starting device %d of %d \"%s\".\n", i, mirroring_source_num, mirroring_source[i] );
+			}
+			pthread_create( &thread[i], NULL, start_mirroring, (void*) mirroring_source[i]);
 		}
 	}
+	pthread_join(thread[0], NULL);  // Wait here for ^C or whatever to terminate.
 	while(1){
 		sleep(1000);
 	}
@@ -979,4 +1423,5 @@ int main( int argc, char **argv ){
 	#endif
 	
 	return 0;
-}
+} // main
+
