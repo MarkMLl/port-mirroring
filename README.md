@@ -18,6 +18,8 @@ Significant changes were made during 2018, these were stored offline and are now
 
 Also see examples in port-mirroring.conf
 
+This has been used fairly heavily in the context of a distributed routing system. Broadly speaking it stood up well, but there are a few residual problems when using multiple layers of encapsulation (from memory, VLAN in conjunction with PPPoE and L2TP). MarkMLl.
+
 
 port-mirroring
 ================
